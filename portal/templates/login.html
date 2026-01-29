@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div style="display: flex; height: 100vh; align-items: center; justify-content: center; background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);">
+    <div style="background: rgba(30, 41, 59, 0.7); padding: 40px; border-radius: 16px; width: 100%; max-width: 400px; border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(10px);">
+        <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #38bdf8; margin: 0;">AuthGuard<span style="font-size: 0.5em; vertical-align: super; opacity: 0.8;">PRO</span></h1>
+            <p style="color: #94a3b8; margin-top: 10px;">Enterprise Behavioral Biometrics</p>
+        </div>
+
+        <form method="POST" action="{{ url_for('login') }}">
+            <div style="margin-bottom: 20px;">
+                <label style="display: block; color: #94a3b8; margin-bottom: 8px;">Business Email</label>
+                <input type="email" name="email" required style="width: 100%; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: white; outline: none;">
+            </div>
+            
+            <div style="margin-bottom: 25px;">
+                <label style="display: block; color: #94a3b8; margin-bottom: 8px;">Password</label>
+                <input type="password" name="password" required style="width: 100%; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: white; outline: none;">
+            </div>
+
+            <button type="submit" style="width: 100%; padding: 14px; background: #38bdf8; color: #000; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; transition: background 0.2s;">
+                Access Dashboard
+            </button>
+        </form>
+
+        <div style="text-align: center; margin-top: 20px;">
+            <a href="{{ url_for('register') }}" style="color: #94a3b8; text-decoration: none; font-size: 0.9em;">Create new merchant account</a>
+        </div>
+    </div>
+</div>
+{% endblock %}

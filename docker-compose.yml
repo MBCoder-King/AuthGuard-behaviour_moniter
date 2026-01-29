@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # 1. The Merchant Dashboard (Where you sell the service)
+  portal:
+    build: 
+      context: .
+      dockerfile: Dockerfile.portal
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_APP=portal/app.py
+      - FLASK_ENV=development
+    env_file:
+      - infrastructure/.env
+    volumes:
+      - ./portal:/app/portal
+    depends_on:
+      - redis
+
+  # 2. The Intelligence Brain (Where the AI lives)
+  intelligence-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "5001:5001"
+    environment:
+      - FLASK_APP=intelligence_api/api.py
+      - FLASK_ENV=development
+    env_file:
+      - infrastructure/.env
+    volumes:
+      - ./intelligence_api:/app/intelligence_api
+    depends_on:
+      - redis
+
+  # 3. Cache Layer for high-speed API responses
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6379:6379"

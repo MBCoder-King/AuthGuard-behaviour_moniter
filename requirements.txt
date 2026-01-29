@@ -1,0 +1,26 @@
+# --- Web Framework & Server ---
+Flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.2.0
+Werkzeug>=3.0.0
+
+# --- Database (NeonDB / PostgreSQL) ---
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.0
+
+# --- AI & Data Science (The Brain) ---
+numpy>=1.26.0
+scikit-learn>=1.3.0
+scipy>=1.11.0
+joblib>=1.3.0
+
+# --- Caching & High Performance ---
+redis>=5.0.0
+
+# --- Utilities & Config ---
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# --- Email & Auth ---
+# (Standard smtplib is built-in, no pip install needed)
+google-auth-oauthlib # (Optional if using Google Login for Dashboard)
