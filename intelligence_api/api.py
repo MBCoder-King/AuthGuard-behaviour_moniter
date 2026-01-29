@@ -1,430 +1,566 @@
-from flask import Flask, request, jsonify
-from middleware import require_api_key
-from db import fetch_user_profile, log_event, get_db, return_db
-from core_logic import analyze_risk
-import json
-import redis
+"""
+AuthGuard Enterprise - Intelligence API
+High-performance behavioral analysis API with Redis caching
+"""
+
 import os
-from otp import generate_otp, send_recovery_email
+import sys
+import logging
+from datetime import datetime
+from typing import Dict, Any, Optional
+import json
 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import redis
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from shared_db import (
+    get_db, get_cache, MerchantDB, ProfileDB, LogDB, 
+    Collections, health_check
+)
+from intelligence_api.core_logic import analyze_risk, detect_bot_movement
+from intelligence_api.middleware import require_api_key, handle_errors
+from intelligence_api.otp_service import OTPService
+from intelligence_api.geo_service import GeoLocationService
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
+app.config['JSON_SORT_KEYS'] = False
 
-# ============================================
-# REDIS CLIENT CONFIGURATION
-# ============================================
-try:
-    redis_client = redis.Redis(
-        host=os.getenv('REDIS_HOST', 'localhost'),
-        port=int(os.getenv('REDIS_PORT', 6379)),
-        db=int(os.getenv('REDIS_DB', 0)),
-        decode_responses=True,  # Automatically decode bytes to strings
-        socket_connect_timeout=5,
-        socket_keepalive=True,
-        health_check_interval=30
-    )
-    # Test connection
-    redis_client.ping()
-    print("✓ Redis connected successfully")
-except redis.ConnectionError as e:
-    print(f"✗ Redis connection failed: {e}")
-    redis_client = None
-except Exception as e:
-    print(f"✗ Redis initialization error: {e}")
-    redis_client = None
+# Enable CORS
+CORS(app, resources={
+    r"/v1/*": {
+        "origins": os.getenv('CORS_ORIGINS', '*').split(','),
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-API-KEY", "Authorization"]
+    }
+})
 
+# Rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["1000 per hour", "100 per minute"],
+    storage_uri=f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', 6379)}"
+)
 
-# ============================================
-# HELPER FUNCTIONS FOR OTP MANAGEMENT
-# ============================================
-def store_otp(uid, code, expiry_seconds=300):
-    """
-    Store OTP in Redis with automatic expiration.
+# Initialize services
+otp_service = OTPService()
+geo_service = GeoLocationService()
+
+# ========================================
+# HEALTH CHECK
+# ========================================
+
+@app.route('/health', methods=['GET'])
+def health():
+    """API health check endpoint"""
+    status = health_check()
     
-    Args:
-        uid (str): User unique identifier
-        code (str): 6-digit OTP code
-        expiry_seconds (int): TTL in seconds (default: 5 minutes)
-    
-    Returns:
-        bool: True if stored successfully, False otherwise
-    """
-    if not redis_client:
-        print(f"⚠️  Redis unavailable, OTP storage failed for {uid}")
-        return False
-    
-    try:
-        key = f"otp:{uid}"
-        redis_client.setex(key, expiry_seconds, code)
-        print(f"✓ OTP stored for {uid}, expires in {expiry_seconds}s")
-        return True
-    except redis.RedisError as e:
-        print(f"✗ Failed to store OTP for {uid}: {e}")
-        return False
+    if status['firestore'] and status['redis']:
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': status['timestamp'],
+            'services': status
+        }), 200
+    else:
+        return jsonify({
+            'status': 'degraded',
+            'timestamp': status['timestamp'],
+            'services': status
+        }), 503
 
 
-def verify_otp(uid, user_code):
-    """
-    Verify OTP code and delete it from Redis on success.
-    
-    Args:
-        uid (str): User unique identifier
-        user_code (str): OTP code provided by user
-    
-    Returns:
-        bool: True if OTP is valid, False otherwise
-    """
-    if not redis_client:
-        print(f"⚠️  Redis unavailable, OTP verification failed for {uid}")
-        return False
-    
-    try:
-        key = f"otp:{uid}"
-        stored_code = redis_client.get(key)
-        
-        # Check if OTP exists and matches
-        if stored_code is None:
-            print(f"⚠️  OTP expired or not found for {uid}")
-            return False
-        
-        # Compare codes (both are strings due to decode_responses=True)
-        if stored_code == str(user_code).strip():
-            # Delete OTP after successful verification
-            redis_client.delete(key)
-            print(f"✓ OTP verified successfully for {uid}")
-            return True
-        else:
-            print(f"✗ OTP mismatch for {uid}")
-            return False
-            
-    except redis.RedisError as e:
-        print(f"✗ OTP verification error for {uid}: {e}")
-        return False
-
-
-def get_otp_attempts(uid, max_attempts=5):
-    """
-    Track OTP verification attempts to prevent brute force.
-    
-    Args:
-        uid (str): User unique identifier
-        max_attempts (int): Maximum allowed attempts
-    
-    Returns:
-        dict: {'allowed': bool, 'attempts': int, 'remaining': int}
-    """
-    if not redis_client:
-        return {'allowed': True, 'attempts': 0, 'remaining': max_attempts}
-    
-    try:
-        attempt_key = f"otp_attempts:{uid}"
-        attempts = int(redis_client.get(attempt_key) or 0)
-        remaining = max_attempts - attempts
-        
-        return {
-            'allowed': remaining > 0,
-            'attempts': attempts,
-            'remaining': max(0, remaining)
+@app.route('/v1/status', methods=['GET'])
+@limiter.limit("10 per minute")
+def api_status():
+    """Detailed API status"""
+    return jsonify({
+        'api_version': '2.0.0',
+        'status': 'operational',
+        'timestamp': datetime.utcnow().isoformat(),
+        'endpoints': {
+            'verify': '/v1/verify',
+            'profile': '/v1/profile',
+            'recover': '/v1/recover/*'
         }
-    except Exception as e:
-        print(f"✗ Error checking OTP attempts for {uid}: {e}")
-        return {'allowed': True, 'attempts': 0, 'remaining': max_attempts}
+    }), 200
 
 
-def increment_otp_attempts(uid, expiry_seconds=900):
-    """
-    Increment OTP verification attempts counter (15 min lockout).
-    
-    Args:
-        uid (str): User unique identifier
-        expiry_seconds (int): How long to track attempts
-    """
-    if not redis_client:
-        return
-    
-    try:
-        attempt_key = f"otp_attempts:{uid}"
-        redis_client.incr(attempt_key)
-        redis_client.expire(attempt_key, expiry_seconds)
-    except redis.RedisError as e:
-        print(f"✗ Error incrementing OTP attempts for {uid}: {e}")
+# ========================================
+# MAIN VERIFICATION ENDPOINT
+# ========================================
 
-
-# ============================================
-# API ROUTES
-# ============================================
-
-@app.route('/v1/session/init', methods=['POST'])
+@app.route('/v1/verify', methods=['POST', 'OPTIONS'])
+@limiter.limit("500 per hour")
 @require_api_key
-def init_session():
+@handle_errors
+def verify_session():
     """
-    Called when a user logs in. Returns their current status.
+    Main behavioral verification endpoint
+    
+    This is called continuously by the client SDK (every 4 seconds)
+    to analyze behavioral patterns in real-time.
+    
+    Request Body:
+        {
+            "user_uid": "user_12345",
+            "telemetry": {
+                "flight_vec": [120, 135, 110, ...],
+                "dwell_vec": [45, 50, 48, ...],
+                "mouse_path": [{x, y, t}, ...],
+                "bot_flags": ["AUTOMATION_TOOL_DETECTED"],
+                "fingerprint": {
+                    "userAgent": "...",
+                    "screenRes": "1920x1080",
+                    "cores": 8,
+                    "timezone": "America/New_York"
+                }
+            },
+            "geo_location": {
+                "lat": 40.7128,
+                "lon": -74.0060
+            }
+        }
+    
+    Response:
+        {
+            "decision": "ALLOW" | "VERIFY" | "LOCK",
+            "risk_score": 0-100,
+            "reasons": ["..."],
+            "metrics": {...},
+            "session_id": "..."
+        }
     """
     try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Invalid JSON"}), 400
+        # Get merchant ID from middleware
+        merchant_id = request.merchant_id
         
-        uid = data.get('user_uid')
-        if not uid:
-            return jsonify({"error": "Missing user_uid"}), 400
-        
-        profile = fetch_user_profile(request.merchant_id, uid)
-        
-        if profile and profile.get('is_locked'):
-            return jsonify({
-                "status": "LOCKED",
-                "locked_until": profile['locked_until']
-            }), 403
-            
-        return jsonify({
-            "status": "ACTIVE",
-            "session_id": f"sess_{uid}_{int(request.timestamp)}"
-        }), 200
-        
-    except Exception as e:
-        print(f"✗ Error in init_session: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route('/v1/verify', methods=['POST'])
-@require_api_key
-def verify_behavior():
-    """
-    The heartbeat. SDK sends telemetry here every 5s.
-    """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Invalid JSON"}), 400
-        
-        uid = data.get('user_uid')
+        # Parse request
+        data = request.get_json()
+        user_uid = data.get('user_uid')
         telemetry = data.get('telemetry', {})
+        geo_location = data.get('geo_location')
         
-        if not uid:
-            return jsonify({"error": "Missing user_uid"}), 400
-        
-        # 1. Get Baseline
-        profile = fetch_user_profile(request.merchant_id, uid)
-        
-        if not profile or not profile.get('baseline_stats'):
-            # Cold Start: Building baseline
-            log_event(request.merchant_id, uid, "BASELINE_BUILD", 0)
+        if not user_uid:
             return jsonify({
-                "decision": "ALLOW",
-                "risk_score": 0,
-                "reason": "Training Phase - Baseline Building"
-            }), 200
+                'error': 'Missing user_uid'
+            }), 400
         
-        # 2. Analyze Risk
-        risk_score, reason = analyze_risk(telemetry, profile)
+        # Get or create user profile
+        profile = ProfileDB.get_profile(merchant_id, user_uid)
         
-        # 3. Make Decision
-        decision = "ALLOW"
-        if risk_score > 75:
+        if not profile:
+            # First time user - create baseline profile
+            profile = {
+                'merchant_id': merchant_id,
+                'user_uid': user_uid,
+                'baseline_stats': {},
+                'trust_score': 100,
+                'is_locked': False,
+                'total_verifications': 0,
+                'known_fingerprints': []
+            }
+            
+            profile_id = ProfileDB.create_profile(
+                merchant_id, 
+                user_uid, 
+                profile
+            )
+            profile['id'] = profile_id
+            
+            logger.info(f"New profile created: {user_uid}")
+        
+        # Update verification count
+        profile['total_verifications'] = profile.get('total_verifications', 0) + 1
+        
+        # Enrich telemetry with geo data
+        if geo_location:
+            telemetry['geo_location'] = geo_location
+        elif request.remote_addr:
+            # Fallback: Get location from IP
+            geo_data = geo_service.get_location_from_ip(request.remote_addr)
+            if geo_data:
+                telemetry['geo_location'] = geo_data
+        
+        # === CORE RISK ANALYSIS ===
+        risk_score, reason, metrics = analyze_risk(telemetry, profile)
+        
+        # Determine decision
+        if risk_score < int(os.getenv('RISK_THRESHOLD_LOW', 40)):
+            decision = "ALLOW"
+        elif risk_score < int(os.getenv('RISK_THRESHOLD_HIGH', 80)):
+            decision = "VERIFY"
+        else:
             decision = "LOCK"
-        elif risk_score > 40:
-            decision = "VERIFY"  # Trigger OTP
+            
+            # Lock the profile
+            ProfileDB.lock_profile(profile['id'], reason)
         
-        # 4. Log Event
-        log_event(request.merchant_id, uid, decision, risk_score)
+        # Update profile with new data
+        if decision != "LOCK":
+            # Update baseline statistics
+            update_data = {
+                'last_session_timestamp': datetime.utcnow(),
+                'trust_score': max(0, 100 - risk_score)
+            }
+            
+            # Add current fingerprint to known devices
+            if 'fingerprint' in telemetry:
+                known_fps = profile.get('known_fingerprints', [])
+                current_fp = telemetry['fingerprint']
+                
+                # Only store unique fingerprints (max 5)
+                if current_fp not in known_fps:
+                    known_fps.append(current_fp)
+                    known_fps = known_fps[-5:]  # Keep last 5
+                    update_data['known_fingerprints'] = known_fps
+            
+            # Update geo location
+            if 'geo_location' in telemetry:
+                update_data['last_geo_location'] = telemetry['geo_location']
+            
+            # Update baseline stats (running average)
+            if telemetry.get('flight_vec'):
+                import numpy as np
+                current_flight_mean = np.mean(telemetry['flight_vec'])
+                
+                old_stats = profile.get('baseline_stats', {})
+                old_flight_mean = old_stats.get('flight_mean', current_flight_mean)
+                
+                # Exponential moving average (alpha = 0.3)
+                new_flight_mean = 0.7 * old_flight_mean + 0.3 * current_flight_mean
+                
+                update_data['baseline_stats'] = {
+                    'flight_mean': new_flight_mean,
+                    'flight_std': np.std(telemetry['flight_vec'])
+                }
+            
+            ProfileDB.update_profile(profile['id'], update_data)
         
-        # 5. Lock Account if needed
-        if decision == "LOCK":
-            conn = get_db()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE behavior_profiles 
-                        SET is_locked = TRUE, 
-                            locked_until = NOW() + INTERVAL '1 hour',
-                            trust_score = 0
-                        WHERE merchant_id = %s AND user_uid = %s
-                    """, (request.merchant_id, uid))
-                    conn.commit()
-                    cur.close()
-                except Exception as db_error:
-                    print(f"✗ Failed to lock account: {db_error}")
-                finally:
-                    return_db(conn)
+        # Deduct API credits
+        MerchantDB.deduct_credits(merchant_id, amount=1)
         
-        return jsonify({
-            "decision": decision,
-            "risk_score": risk_score,
-            "reason": reason
-        }), 200
+        # Log the verification
+        log_data = {
+            'user_uid': user_uid,
+            'risk_score': risk_score,
+            'decision': decision,
+            'reason': reason,
+            'event_type': 'behavioral_verification',
+            'ip_address': request.remote_addr,
+            'metrics': metrics
+        }
+        LogDB.create_log(merchant_id, log_data)
+        
+        # Build response
+        response = {
+            'decision': decision,
+            'risk_score': risk_score,
+            'reasons': metrics.get('risk_factors', []),
+            'trust_score': 100 - risk_score,
+            'session_id': f"sess_{datetime.utcnow().timestamp()}",
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        # Add detailed metrics for VERIFY/LOCK decisions
+        if decision in ['VERIFY', 'LOCK']:
+            response['metrics'] = metrics
+        
+        logger.info(
+            f"Verification: user={user_uid}, "
+            f"risk={risk_score}, decision={decision}"
+        )
+        
+        return jsonify(response), 200
         
     except Exception as e:
-        print(f"✗ Error in verify_behavior: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        logger.error(f"Verification error: {e}", exc_info=True)
+        return jsonify({
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
 
+
+# ========================================
+# PROFILE MANAGEMENT
+# ========================================
+
+@app.route('/v1/profile/<user_uid>', methods=['GET'])
+@require_api_key
+@handle_errors
+def get_user_profile(user_uid: str):
+    """Get user behavioral profile"""
+    merchant_id = request.merchant_id
+    
+    profile = ProfileDB.get_profile(merchant_id, user_uid)
+    
+    if not profile:
+        return jsonify({
+            'error': 'Profile not found'
+        }), 404
+    
+    # Remove sensitive internal data
+    safe_profile = {
+        'user_uid': profile['user_uid'],
+        'trust_score': profile.get('trust_score', 100),
+        'is_locked': profile.get('is_locked', False),
+        'total_verifications': profile.get('total_verifications', 0),
+        'created_at': profile.get('created_at'),
+        'last_session': profile.get('last_session_timestamp')
+    }
+    
+    return jsonify(safe_profile), 200
+
+
+@app.route('/v1/profile/<user_uid>/reset', methods=['POST'])
+@require_api_key
+@handle_errors
+def reset_user_profile(user_uid: str):
+    """Reset user behavioral profile (admin action)"""
+    merchant_id = request.merchant_id
+    
+    profile = ProfileDB.get_profile(merchant_id, user_uid)
+    
+    if not profile:
+        return jsonify({
+            'error': 'Profile not found'
+        }), 404
+    
+    # Reset to defaults
+    ProfileDB.update_profile(profile['id'], {
+        'baseline_stats': {},
+        'trust_score': 100,
+        'is_locked': False,
+        'failed_attempts': 0,
+        'known_fingerprints': []
+    })
+    
+    logger.info(f"Profile reset: {user_uid}")
+    
+    return jsonify({
+        'success': True,
+        'message': 'Profile reset successfully'
+    }), 200
+
+
+# ========================================
+# ACCOUNT RECOVERY
+# ========================================
 
 @app.route('/v1/recover/request', methods=['POST'])
+@limiter.limit("5 per hour")
 @require_api_key
-def request_unlock():
+@handle_errors
+def request_recovery():
     """
-    Request an OTP code to unlock a locked account.
+    Request account unlock via email OTP
+    
+    Request Body:
+        {
+            "user_uid": "user_12345",
+            "email": "user@example.com"
+        }
     """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Invalid JSON"}), 400
-        
-        uid = data.get('user_uid')
-        email = data.get('email')
-        
-        if not uid or not email:
-            return jsonify({"error": "Missing user_uid or email"}), 400
-        
-        # Validate email format
-        if '@' not in email or len(email) < 5:
-            return jsonify({"error": "Invalid email format"}), 400
-        
-        # 1. Generate OTP Code
-        code = generate_otp()
-        
-        # 2. Store in Redis (5 minute expiry)
-        if not store_otp(uid, code, expiry_seconds=300):
-            return jsonify({"error": "OTP service unavailable"}), 503
-        
-        # 3. Send Email
-        success = send_recovery_email(email, code)
-        
-        if success:
-            log_event(request.merchant_id, uid, "OTP_REQUESTED", 0)
-            return jsonify({
-                "success": True,
-                "message": "OTP sent successfully",
-                "expires_in": 300
-            }), 200
-        else:
-            # Clean up Redis if email send failed
-            if redis_client:
-                redis_client.delete(f"otp:{uid}")
-            log_event(request.merchant_id, uid, "OTP_SEND_FAILED", 0)
-            return jsonify({"error": "Failed to send email"}), 500
-        
-    except Exception as e:
-        print(f"✗ Error in request_unlock: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+    merchant_id = request.merchant_id
+    data = request.get_json()
+    
+    user_uid = data.get('user_uid')
+    email = data.get('email')
+    
+    if not user_uid or not email:
+        return jsonify({
+            'error': 'Missing required fields'
+        }), 400
+    
+    # Get profile
+    profile = ProfileDB.get_profile(merchant_id, user_uid)
+    
+    if not profile:
+        return jsonify({
+            'error': 'Profile not found'
+        }), 404
+    
+    if not profile.get('is_locked'):
+        return jsonify({
+            'error': 'Account is not locked'
+        }), 400
+    
+    # Generate and send OTP
+    success = otp_service.send_otp(email, user_uid)
+    
+    if success:
+        logger.info(f"Recovery OTP sent: {user_uid}")
+        return jsonify({
+            'success': True,
+            'message': 'Recovery code sent to email'
+        }), 200
+    else:
+        return jsonify({
+            'error': 'Failed to send recovery email'
+        }), 500
 
 
 @app.route('/v1/recover/verify', methods=['POST'])
+@limiter.limit("10 per hour")
 @require_api_key
-def verify_unlock():
+@handle_errors
+def verify_recovery():
     """
-    Verify OTP code and unlock the account.
+    Verify OTP and unlock account
+    
+    Request Body:
+        {
+            "user_uid": "user_12345",
+            "otp": "123456"
+        }
     """
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Invalid JSON"}), 400
+    merchant_id = request.merchant_id
+    data = request.get_json()
+    
+    user_uid = data.get('user_uid')
+    otp_code = data.get('otp')
+    
+    if not user_uid or not otp_code:
+        return jsonify({
+            'error': 'Missing required fields'
+        }), 400
+    
+    # Verify OTP
+    if otp_service.verify_otp(user_uid, otp_code):
+        # Get profile
+        profile = ProfileDB.get_profile(merchant_id, user_uid)
         
-        uid = data.get('user_uid')
-        user_code = data.get('otp')
-        
-        if not uid or not user_code:
-            return jsonify({"error": "Missing user_uid or otp"}), 400
-        
-        # Check brute force attempts
-        attempts_info = get_otp_attempts(uid, max_attempts=5)
-        if not attempts_info['allowed']:
-            return jsonify({
-                "success": False,
-                "error": "Too many attempts. Please try again later.",
-                "remaining_attempts": 0
-            }), 429  # Too Many Requests
-        
-        # Verify OTP
-        is_valid = verify_otp(uid, user_code)
-        
-        if is_valid:
-            # 2. Unlock Account in Database
-            conn = get_db()
-            if not conn:
-                return jsonify({"error": "Database unavailable"}), 503
+        if profile:
+            # Unlock account
+            ProfileDB.unlock_profile(profile['id'])
             
-            try:
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE behavior_profiles 
-                    SET is_locked = FALSE, 
-                        trust_score = 90, 
-                        locked_until = NULL
-                    WHERE merchant_id = %s AND user_uid = %s
-                """, (request.merchant_id, uid))
-                conn.commit()
-                cur.close()
-                
-                # Clear attempts counter on success
-                if redis_client:
-                    redis_client.delete(f"otp_attempts:{uid}")
-                
-                log_event(request.merchant_id, uid, "ACCOUNT_UNLOCKED", 0)
-                return jsonify({
-                    "success": True,
-                    "message": "Account unlocked successfully"
-                }), 200
-                
-            except Exception as db_error:
-                print(f"✗ Database error during unlock: {db_error}")
-                return jsonify({"error": "Failed to unlock account"}), 500
-            finally:
-                return_db(conn)
-        else:
-            # Invalid OTP - increment attempts
-            increment_otp_attempts(uid)
-            attempts_info = get_otp_attempts(uid)
+            # Log recovery
+            LogDB.create_log(merchant_id, {
+                'user_uid': user_uid,
+                'event_type': 'account_recovery',
+                'ip_address': request.remote_addr
+            })
             
-            log_event(request.merchant_id, uid, "OTP_VERIFICATION_FAILED", 0)
+            logger.info(f"Account unlocked: {user_uid}")
+            
             return jsonify({
-                "success": False,
-                "error": "Invalid OTP code",
-                "remaining_attempts": attempts_info['remaining']
-            }), 400
-        
-    except Exception as e:
-        print(f"✗ Error in verify_unlock: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+                'success': True,
+                'message': 'Account unlocked successfully'
+            }), 200
+    
+    return jsonify({
+        'success': False,
+        'error': 'Invalid or expired code'
+    }), 401
 
 
-# ============================================
+# ========================================
+# ANALYTICS & REPORTING
+# ========================================
+
+@app.route('/v1/analytics/summary', methods=['GET'])
+@require_api_key
+@handle_errors
+def get_analytics_summary():
+    """Get merchant analytics summary"""
+    merchant_id = request.merchant_id
+    
+    # Get stats from database
+    db = get_db()
+    
+    # Count profiles
+    profiles_count = len(list(
+        db.collection(Collections.PROFILES)
+        .where('merchant_id', '==', merchant_id)
+        .stream()
+    ))
+    
+    # Get recent logs
+    recent_logs = LogDB.get_recent_logs(merchant_id, limit=100)
+    
+    # Calculate statistics
+    total_verifications = len(recent_logs)
+    threats_blocked = len([l for l in recent_logs if l.get('decision') == 'LOCK'])
+    
+    risk_scores = [l.get('risk_score', 0) for l in recent_logs]
+    avg_risk = sum(risk_scores) / len(risk_scores) if risk_scores else 0
+    
+    return jsonify({
+        'total_protected_users': profiles_count,
+        'total_verifications': total_verifications,
+        'threats_blocked': threats_blocked,
+        'average_risk_score': round(avg_risk, 2),
+        'timestamp': datetime.utcnow().isoformat()
+    }), 200
+
+
+# ========================================
 # ERROR HANDLERS
-# ============================================
-
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify({"error": "Bad Request"}), 400
+# ========================================
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({"error": "Endpoint Not Found"}), 404
+    return jsonify({
+        'error': 'Endpoint not found',
+        'status': 404
+    }), 404
+
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({"error": "Internal Server Error"}), 500
+    logger.error(f"Internal error: {error}")
+    return jsonify({
+        'error': 'Internal server error',
+        'status': 500
+    }), 500
 
 
-# ============================================
-# SHUTDOWN HANDLER
-# ============================================
-
-@app.teardown_appcontext
-def close_redis(error):
-    """Close Redis connection on app shutdown."""
-    if redis_client:
-        try:
-            redis_client.close()
-            print("✓ Redis connection closed")
-        except Exception as e:
-            print(f"✗ Error closing Redis: {e}")
+@app.errorhandler(429)
+def rate_limit_exceeded(error):
+    return jsonify({
+        'error': 'Rate limit exceeded',
+        'message': 'Too many requests. Please try again later.',
+        'status': 429
+    }), 429
 
 
-# ============================================
-# APPLICATION STARTUP
-# ============================================
+# ========================================
+# STARTUP
+# ========================================
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5001))
-    debug = os.getenv('FLASK_ENV', 'production') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    port = int(os.getenv('API_PORT', 5001))
+    host = os.getenv('API_HOST', '0.0.0.0')
+    debug = os.getenv('ENV', 'production') != 'production'
+    
+    logger.info(f"🚀 AuthGuard Intelligence API starting on {host}:{port}")
+    logger.info(f"Environment: {os.getenv('ENV', 'production')}")
+    logger.info(f"Debug mode: {debug}")
+    
+    # Initialize database connection
+    try:
+        get_db()
+        logger.info("✅ Database connection established")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+    
+    app.run(
+        host=host,
+        port=port,
+        debug=debug,
+        threaded=True
+    )

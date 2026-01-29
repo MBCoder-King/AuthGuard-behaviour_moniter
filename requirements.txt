@@ -1,26 +1,92 @@
-# --- Web Framework & Server ---
-Flask>=3.0.0
-flask-cors>=4.0.0
-gunicorn>=21.2.0
-Werkzeug>=3.0.0
+# ========================================
+# AUTHGUARD ENTERPRISE DEPENDENCIES
+# ========================================
 
-# --- Database (NeonDB / PostgreSQL) ---
-psycopg2-binary>=2.9.9
-SQLAlchemy>=2.0.0
+# --- Core Web Framework ---
+Flask==3.0.0
+flask-cors==4.0.0
+flask-limiter==3.5.0
+flask-mail==0.9.1
+flask-wtf==1.2.1
+gunicorn==21.2.0
+Werkzeug==3.0.1
 
-# --- AI & Data Science (The Brain) ---
-numpy>=1.26.0
-scikit-learn>=1.3.0
-scipy>=1.11.0
-joblib>=1.3.0
+# --- Database & Cache ---
+firebase-admin==6.3.0
+redis==5.0.1
+redis-om==0.2.1
 
-# --- Caching & High Performance ---
-redis>=5.0.0
+# --- Authentication & Security ---
+PyJWT==2.8.0
+bcrypt==4.1.2
+cryptography==41.0.7
+python-jose==3.3.0
+passlib==1.7.4
 
-# --- Utilities & Config ---
-python-dotenv>=1.0.0
-requests>=2.31.0
+# --- AI & Machine Learning ---
+numpy==1.26.2
+scikit-learn==1.3.2
+scipy==1.11.4
+pandas==2.1.4
+joblib==1.3.2
+tensorflow==2.15.0
 
-# --- Email & Auth ---
-# (Standard smtplib is built-in, no pip install needed)
-google-auth-oauthlib # (Optional if using Google Login for Dashboard)
+# --- API & Networking ---
+requests==2.31.0
+httpx==0.25.2
+aiohttp==3.9.1
+websockets==12.0
+
+# --- Data Validation ---
+pydantic==2.5.3
+marshmallow==3.20.1
+email-validator==2.1.0
+python-dotenv==1.0.0
+
+# --- Monitoring & Logging ---
+sentry-sdk==1.39.1
+python-json-logger==2.0.7
+colorlog==6.8.0
+
+# --- Task Queue ---
+celery==5.3.4
+kombu==5.3.4
+
+# --- Testing ---
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-asyncio==0.21.1
+faker==21.0.0
+
+# --- Utilities ---
+python-dateutil==2.8.2
+pytz==2023.3
+pillow==10.1.0
+qrcode==7.4.2
+
+# --- Payment Processing ---
+stripe==7.8.0
+
+# --- IP & Geo-Location ---
+geoip2==4.7.0
+maxminddb==2.5.1
+ipaddress==1.0.23
+
+# --- Rate Limiting & Security ---
+slowapi==0.1.9
+python-multipart==0.0.6
+
+# --- Development Tools ---
+black==23.12.1
+flake8==6.1.0
+mypy==1.7.1
+pre-commit==3.6.0
+
+# --- Documentation ---
+sphinx==7.2.6
+sphinx-rtd-theme==2.0.0
+
+# --- Export & Reporting ---
+reportlab==4.0.8
+xlsxwriter==3.1.9
+matplotlib==3.8.2
